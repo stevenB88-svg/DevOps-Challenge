@@ -1,0 +1,53 @@
+name: Deploy to ECR
+
+on:
+  push:
+    branches:
+      - develop  # Se ejecuta cuando haces push a main
+
+env:
+  AWS_REGION: us-east-1  # Cambia según tu región
+  ECR_REPOSITORY: mi-microservicio
+  IMAGE_TAG: latest
+  
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v3
+
+    - name: Configurar credenciales de AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    - name: crear ECR repository 
+      run: |
+        aws ecr create-repository --repository-name mi-microservicio
+
+    - name: Iniciar sesión en Amazon ECR
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+    - name: Construir la imagen Docker
+      run: |
+        cd app
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+        docker tag $ECR_REPOSITORY:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Subir la imagen a ECR
+      run: |
+        cd app
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Mostrar imágenes en ECR
+      run: |
+        aws ecr describe-images --repository-name $ECR_REPOSITORY

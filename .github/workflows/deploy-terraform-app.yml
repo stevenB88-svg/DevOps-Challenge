@@ -1,0 +1,168 @@
+name: Deploy Microservice to AWS ECS
+
+on:
+  push:
+    branches:
+      - main  # Se ejecuta cuando haces push a main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: mi-microservicio
+  IMAGE_TAG: latest
+  TF_STATE_BUCKET: my-terraform-state-bucket
+  TF_STATE_DYNAMODB: my-terraform-lock-table
+  ECS_CLUSTER: "nginx-cluster"
+  ECS_SERVICE: "nginx-service"
+  ECS_TASK_DEFINITION: "nginx-task"
+
+jobs:
+  build:
+    name: Build & Push Docker Image to ECR
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout código
+      uses: actions/checkout@v3
+
+    - name: Configurar credenciales de AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Crear ECR repository si no existe
+      run: |
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY
+
+    - name: Iniciar sesión en Amazon ECR
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+    - name: Construir y etiquetar imagen Docker
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        docker build -t $ECR_REPOSITORY:$IMAGE_TAG app/
+        docker tag $ECR_REPOSITORY:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Subir la imagen a ECR
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+  terraform:
+    name: Terraform Plan & Apply
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+
+    - name: Terraform Init
+      run: |
+        terraform -chdir=terraform init \
+          -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+          -backend-config="dynamodb_table=${{ env.TF_STATE_DYNAMODB }}"
+
+    - name: Terraform Plan
+      run: |
+        terraform -chdir=terraform plan -out=tfplan
+
+    - name: Terraform Apply
+      run: |
+        terraform -chdir=terraform apply -auto-approve tfplan
+
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+    - name: Configurar credenciales de AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Actualizar la tarea ECS
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+        NEW_IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG"
+
+        # Obtener la definición de la tarea actual
+        aws ecs describe-task-definition --task-definition $ECS_TASK_DEFINITION \
+          --query "taskDefinition" > task-def.json
+
+        # Eliminar parámetros inválidos
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' task-def.json > clean-task-def.json
+
+        # Reemplazar la imagen en la definición de la tarea
+        jq --arg IMAGE "$NEW_IMAGE_URI" '.containerDefinitions[0].image = $IMAGE' clean-task-def.json > new-task-def.json
+
+        # Registrar la nueva versión de la tarea
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query "taskDefinition.taskDefinitionArn" --output text)
+
+        # Actualizar el servicio ECS con la nueva definición de tarea
+        aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $NEW_TASK_DEF_ARN
+
+    - name: Verificar despliegue en ECS
+      run: |
+        echo "Esperando a que las tareas ECS estén en estado RUNNING..."
+        sleep 30
+
+        TASKS_RUNNING=$(aws ecs list-tasks --cluster $ECS_CLUSTER --query 'taskArns' --output text)
+
+        if [ -z "$TASKS_RUNNING" ]; then
+          echo "❌ ERROR: No ECS Task is running"
+          exit 1
+        fi
+
+        echo "✅ ECS Tasks en ejecución: $TASKS_RUNNING"
+
+  verify:
+    name: Verify Service URL
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+    - name: Configurar credenciales de AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Obtener URL del Load Balancer
+      run: |
+        SERVICE_URL=$(aws elbv2 describe-load-balancers --query "LoadBalancers[*].DNSName" --output text)
+
+        if [ -z "$SERVICE_URL" ]; then
+          echo "❌ ERROR: No se encontró un Load Balancer asociado"
+          exit 1
+        fi
+
+        echo "🌍 Service URL: http://$SERVICE_URL"
+
+        # Verificar que el servicio responde correctamente
+        HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" http://$SERVICE_URL/hello)
+
+        if [ "$HTTP_STATUS" -eq 200 ]; then
+          echo "✅ Servicio funcionando correctamente en: http://$SERVICE_URL"
+        else
+          echo "❌ ERROR: El servicio no está respondiendo correctamente"
+          exit 1
+        fi
